@@ -3,7 +3,11 @@ import numpy as np
 import streamlit as st
 import tensorflow as tf
 from PIL import Image
+from dotenv import load_dotenv
 from db_manager import BiteDBManager
+from download_model import ensure_model
+
+load_dotenv()
 
 # ---------------------------------------------------------
 # Page Configuration & Constants
@@ -26,14 +30,14 @@ CLASSES = [
 ]
 
 CHANNEL_MEANS = np.array([170.88408, 134.76701, 118.84133], dtype=np.float32)
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-MODEL_PATH = os.path.join(BASE_DIR, "models", "bug_bite_8class_stacked_model.keras")
+MODEL_PATH = os.getenv("MODEL_PATH", "models/bug_bite_8class_stacked_model.keras")
 
 # ---------------------------------------------------------
 # Resource Initialization
 # ---------------------------------------------------------
 @st.cache_resource
 def load_classifier():
+    ensure_model(MODEL_PATH)
     if not os.path.exists(MODEL_PATH):
         st.error(f"Model file not found at path: `{MODEL_PATH}`")
         st.stop()

@@ -1,5 +1,7 @@
-﻿*.keras
+*.keras
 models/*.keras
+*.part
+models/*.part
 venv/
 .venv/
 __pycache__/

@@ -6,3 +6,6 @@ scikit-learn>=1.0.0
 pymongo>=4.0.0
 dnspython>=2.0.0
 certifi
+requests
+tqdm
+python-dotenv

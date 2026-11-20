@@ -3,12 +3,16 @@ import numpy as np
 import tensorflow as tf
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
 from sklearn.metrics import classification_report, confusion_matrix
+from dotenv import load_dotenv
+from download_model import ensure_model
+
+load_dotenv()
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # 1. Path to your local testing directory
 TEST_DIR = r"D:\Career\Dataset\.dataset\datasets\external\stage1\insect-bite-dataset\testing"
-MODEL_PATH = os.path.join(BASE_DIR, "models", "bug_bite_8class_stacked_model.keras")
+MODEL_PATH = os.getenv("MODEL_PATH", "models/bug_bite_8class_stacked_model.keras")
 
 # 2. Classes matching the model's output layer
 CLASSES = [
@@ -29,6 +33,7 @@ def paper_preprocess(x):
     return (x - CHANNEL_MEANS) / 255.0
 
 print(f"Loading model from: {MODEL_PATH}")
+ensure_model(MODEL_PATH)
 model = tf.keras.models.load_model(MODEL_PATH)
 print("Model loaded successfully.\n")
 

@@ -229,33 +229,56 @@ Use these clinical configurations to test both pure vision and multimodal fusion
 
 ---
 
-## ⚙️ Installation & Setup
+## ⚙️ Installation & Setup (Local Laptop)
+
+ResQ_Ai is fully configured for zero manual model setup. The 1.7 GB trained model (`bug_bite_8class_stacked_model.keras`) is automatically streamed and verified from GitHub Releases on first execution.
 
 ### 1. Clone Repository & Setup Virtual Environment
 ```bash
-git clone <repository_url>
-cd bug_bite_classifier
+git clone https://github.com/nithishv17-dot/ResQ_Ai.git
+cd ResQ_Ai
 
-# Create virtual environment
+# Create virtual environment (Python 3.11 recommended)
 python -m venv venv
 
-# Activate virtual environment (Windows)
-venv\Scripts\activate
-
-# Activate virtual environment (Linux/macOS)
+# Activate virtual environment
+# Windows (PowerShell):
+.\venv\Scripts\Activate.ps1
+# Windows (Command Prompt):
+.\venv\Scripts\activate.bat
+# Linux / macOS:
 source venv/bin/activate
 ```
 
 ### 2. Install Dependencies
 ```bash
+python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-### 3. Ensure Model Artifact Location
-Ensure the trained model artifact exists at:
+### 3. Environment Configuration (Optional)
+A `.env.example` file is included in the repository. To customize or override model paths or release URLs, create a `.env` file:
+```bash
+# Windows
+copy .env.example .env
+
+# Linux / macOS
+cp .env.example .env
 ```
-models/bug_bite_8class_stacked_model.keras
+Default `.env` values:
+```env
+MODEL_PATH=models/bug_bite_8class_stacked_model.keras
+MODEL_URL=https://github.com/nithishv17-dot/ResQ_Ai/releases/download/v1.0.0/bug_bite_8class_stacked_model.keras
 ```
+
+### 4. Automated Model Download (Zero Manual Setup)
+You do **not** need to manually download or move large model files:
+* When running `streamlit run app.py` or `python predict.py`, the system checks whether `models/bug_bite_8class_stacked_model.keras` exists and is valid (>100 MB).
+* If missing, it will automatically stream-download the ~1.7 GB `.keras` model asset from GitHub Releases with a progress bar, safely staging it via a temporary `.part` file.
+* To pre-download the model at any time without running the app:
+  ```bash
+  python download_model.py
+  ```
 
 ---
 
@@ -404,11 +427,13 @@ bug_bite_classifier/
 │
 ├── app.py                   # Interactive Streamlit web app with multimodal Bayesian fusion
 ├── db_manager.py            # MongoDB Atlas manager for audit logging & longitudinal tracking
+├── download_model.py        # Automated stream downloader for GitHub Release 1.7GB model
 ├── predict.py               # Automated single & batch CLI prediction script
 ├── evaluate_test_set.py     # Batch evaluation script for test dataset benchmarking
-├── requirements.txt         # Project dependencies
+├── requirements.txt         # Project dependencies (including requests, tqdm, python-dotenv)
+├── .env.example             # Template for model path & GitHub Release URL overrides
 ├── models/
-│   └── bug_bite_8class_stacked_model.keras   # Trained 1.8GB stacked ensemble model
+│   └── bug_bite_8class_stacked_model.keras   # 1.7GB model (auto-downloaded, gitignored)
 └── test_images/             # Sample test images for local verification
 ```
 

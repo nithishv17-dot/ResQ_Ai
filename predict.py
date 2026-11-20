@@ -15,6 +15,10 @@ if sys.platform == 'win32' and hasattr(sys.stdout, 'reconfigure'):
 import numpy as np
 import tensorflow as tf
 from PIL import Image
+from dotenv import load_dotenv
+from download_model import ensure_model
+
+load_dotenv()
 
 # 1. Classes in exact alphabetical order matching model output layer
 CLASSES = [
@@ -35,9 +39,10 @@ VALID_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.bmp', '.webp', '.JPG', '.JPEG', '
 CHANNEL_MEANS = np.array([170.88408, 134.76701, 118.84133], dtype=np.float32)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-MODEL_PATH = os.path.join(BASE_DIR, 'models', 'bug_bite_8class_stacked_model.keras')
+MODEL_PATH = os.getenv("MODEL_PATH", "models/bug_bite_8class_stacked_model.keras")
 
 print("Loading model...")
+ensure_model(MODEL_PATH)
 model = tf.keras.models.load_model(MODEL_PATH)
 print("Model loaded successfully.\n")
 
