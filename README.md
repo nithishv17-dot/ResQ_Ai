@@ -277,57 +277,28 @@ MODEL_PATH=models/bug_bite_8class_stacked_model.keras
 MODEL_URL=https://github.com/nithishv17-dot/ResQ_Ai/releases/download/v1.0.0/bug_bite_8class_stacked_model.keras
 ```
 
-### Step 4: Automated Model Download & Launch
+### Step 4: Automated Model Download
 You do **not** need to manually download or move large model files:
-* When running `streamlit run app.py` or `python predict.py`, `download_model.py` checks whether `models/bug_bite_8class_stacked_model.keras` exists and is valid (>100 MB).
+* When running the application, `download_model.py` checks whether `models/bug_bite_8class_stacked_model.keras` exists and is valid (>100 MB).
 * If missing, it automatically stream-downloads the ~1.7 GB `.keras` model asset from GitHub Releases with an interactive progress bar, safely staging it via a temporary `.part` file.
-* To pre-download the model at any time without running the web app:
+* To pre-download the model at any time before running the web app:
   ```bash
   python download_model.py
   ```
-
-Launch the interactive Streamlit web dashboard:
-```bash
-streamlit run app.py
-```
-Open your browser at **`http://localhost:8501`**.
 
 ---
 
 ## 🚀 Usage
 
-### 1. Run Interactive Streamlit Web Application
-Launch the web interface supporting both pure vision mode and multimodal Bayesian context fusion:
+Launch the interactive Streamlit web application:
 ```bash
 streamlit run app.py
 ```
 
-### 2. Run Single or Batch Command-Line Predictions (`predict.py`)
-[`predict.py`](file:///d:/Career/OnGoing/.Team%20Project%20OG/bug_bite_classifier/predict.py) supports automated directory scanning and dynamic CLI arguments:
+Once launched, open your web browser and navigate to:
+👉 **`http://localhost:8501`**
 
-* **Automatic Directory Scan (Zero Configuration):**  
-  Drop any `.jpg`, `.jpeg`, `.png`, or `.webp` images into the [`test_images/`](file:///d:/Career/OnGoing/.Team%20Project%20OG/bug_bite_classifier/test_images) directory and run:
-  ```powershell
-  python predict.py
-  ```
-  The script automatically detects all images in the folder, logs their file names, and outputs predictions and confidence bars.
-
-* **Predict a Specific Image:**
-  ```powershell
-  python predict.py test_images/bed_bugs_r_1.jpg
-  ```
-
-* **Predict All Images in a Custom Folder:**
-  ```powershell
-  python predict.py "C:\path\to\my_folder"
-  ```
-
-### 3. Run Test Set Evaluation (`evaluate_test_set.py`)
-Evaluate comprehensive classification metrics across your local test dataset split:
-```powershell
-python evaluate_test_set.py
-```
-Outputs total test samples, overall loss, categorical accuracy, and a per-class scikit-learn `classification_report` (Precision, Recall, F1-Score).
+The web interface supports both **Pure Vision Mode** (image-only diagnosis) and **Multimodal Bayesian Context Fusion** (incorporating anatomical bite location, onset timing, and clinical signs with automatic conflict rejection gatekeeping).
 
 ---
 
