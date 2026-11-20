@@ -231,14 +231,20 @@ Use these clinical configurations to test both pure vision and multimodal fusion
 
 ## ⚙️ Installation & Setup (Local Laptop)
 
-ResQ_Ai is fully configured for zero manual model setup. The 1.7 GB trained model (`bug_bite_8class_stacked_model.keras`) is automatically streamed and verified from GitHub Releases on first execution.
+ResQ AI is fully configured for zero manual model setup. The 1.7 GB trained stacked ensemble model (`bug_bite_8class_stacked_model.keras`) is automatically streamed and verified from GitHub Releases on first execution.
 
-### 1. Clone Repository & Setup Virtual Environment
+### System Requirements
+* **OS:** Windows 10/11 (64-bit), macOS, or Linux.
+* **Python:** Python 3.10–3.11 (64-bit) recommended.
+* **Disk Space:** At least 3.5 GB free disk space (1.7 GB model + TensorFlow dependencies).
+* **RAM:** At least 8 GB RAM recommended.
+
+### Step 1: Clone Repository & Setup Virtual Environment
 ```bash
 git clone https://github.com/nithishv17-dot/ResQ_Ai.git
 cd ResQ_Ai
 
-# Create virtual environment (Python 3.11 recommended)
+# Create virtual environment (Python 3.10–3.11 recommended)
 python -m venv venv
 
 # Activate virtual environment
@@ -250,13 +256,13 @@ python -m venv venv
 source venv/bin/activate
 ```
 
-### 2. Install Dependencies
+### Step 2: Install Dependencies
 ```bash
 python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-### 3. Environment Configuration (Optional)
+### Step 3: Environment Configuration (Optional)
 A `.env.example` file is included in the repository. To customize or override model paths or release URLs, create a `.env` file:
 ```bash
 # Windows
@@ -271,14 +277,20 @@ MODEL_PATH=models/bug_bite_8class_stacked_model.keras
 MODEL_URL=https://github.com/nithishv17-dot/ResQ_Ai/releases/download/v1.0.0/bug_bite_8class_stacked_model.keras
 ```
 
-### 4. Automated Model Download (Zero Manual Setup)
+### Step 4: Automated Model Download & Launch
 You do **not** need to manually download or move large model files:
-* When running `streamlit run app.py` or `python predict.py`, the system checks whether `models/bug_bite_8class_stacked_model.keras` exists and is valid (>100 MB).
-* If missing, it will automatically stream-download the ~1.7 GB `.keras` model asset from GitHub Releases with a progress bar, safely staging it via a temporary `.part` file.
-* To pre-download the model at any time without running the app:
+* When running `streamlit run app.py` or `python predict.py`, `download_model.py` checks whether `models/bug_bite_8class_stacked_model.keras` exists and is valid (>100 MB).
+* If missing, it automatically stream-downloads the ~1.7 GB `.keras` model asset from GitHub Releases with an interactive progress bar, safely staging it via a temporary `.part` file.
+* To pre-download the model at any time without running the web app:
   ```bash
   python download_model.py
   ```
+
+Launch the interactive Streamlit web dashboard:
+```bash
+streamlit run app.py
+```
+Open your browser at **`http://localhost:8501`**.
 
 ---
 
@@ -395,25 +407,108 @@ The system integrates with **MongoDB Atlas Cloud** via [`db_manager.py`](file://
 | **`pymongo` / `certifi`** | `>=4.4.0` | Secure TLS connection and audit persistence to MongoDB Atlas. |
 | **`scikit-learn`** | `>=1.2.0` | Test set evaluation metrics, confusion matrices, and classification reports. |
 | **`numpy`** | `>=1.23.0` | Fast multidimensional matrix arithmetic and channel mean normalization. |
+| **`requests`** | `>=2.28.0` | HTTP streaming client for automated 1.7 GB GitHub Releases model downloading. |
+| **`tqdm`** | `>=4.60.0` | Visual real-time download progress bar. |
+| **`python-dotenv`** | `>=1.0.0` | Loads environment variables from `.env` (overriding `MODEL_PATH` and `MODEL_URL`). |
+
+---
+
+## 👥 GitHub Workflow & Contributing Rules
+
+### 1. Pulling Updates
+Always pull the latest changes on the main branch before beginning work:
+```bash
+git checkout main
+git pull origin main
+```
+
+### 2. Git Hygiene & Pre-Commit Safeguards
+* **Never commit large model binaries:** `.keras`, `.part`, `.h5`, or local dataset folders must remain untracked.
+* **Never commit secrets:** Never commit `.env` or personal credentials.
+* **Verify git status before pushing:**
+  ```bash
+  git status
+  ```
+  The repository's [.gitignore](.gitignore) automatically excludes:
+  ```text
+  *.keras
+  models/*.keras
+  *.part
+  models/*.part
+  venv/
+  .venv/
+  __pycache__/
+  .env
+  *.db
+  ```
+
+### 3. Publishing a New Model Version
+To update the model weights in production:
+1. Navigate to the GitHub repository: **Releases -> Draft a new release**.
+2. Assign a release tag (e.g., `v1.1.0`) and title.
+3. Attach the new `.keras` binary file as a release asset.
+4. Copy the direct browser asset download URL (`https://github.com/nithishv17-dot/ResQ_Ai/releases/download/<tag>/<filename>.keras`).
+5. Update `MODEL_URL` in [.env.example](.env.example) and `DEFAULT_MODEL_URL` in [download_model.py](download_model.py).
 
 ---
 
 ## ❓ Frequently Asked Questions (FAQ) & Troubleshooting
 
 <details>
-<summary><b>Q1: What is the temporary <code>tmp...</code> folder created in <code>models/</code>?</b></summary>
+<summary><b>Q1: What should I do if the 1.7 GB model download is interrupted or corrupted?</b></summary>
+
+`download_model.py` stages downloads using a `.part` temporary file and verifies the file size (>100 MB) before finalizing. If an interrupted or corrupted file remains in `models/`, delete it and re-run:
+- **Windows (PowerShell):**
+  ```powershell
+  Remove-Item -Force models/*.part, models/*.keras -ErrorAction SilentlyContinue
+  python download_model.py
+  ```
+- **macOS / Linux:**
+  ```bash
+  rm -f models/*.part models/*.keras
+  python download_model.py
+  ```
+</details>
+
+<details>
+<summary><b>Q2: How do I fix PowerShell script execution policy errors?</b></summary>
+
+If running `.\venv\Scripts\Activate.ps1` produces `cannot be loaded because running scripts is disabled on this system`, enable script execution for your current session:
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\venv\Scripts\Activate.ps1
+```
+</details>
+
+<details>
+<summary><b>Q3: What if port 8501 is already in use by Streamlit?</b></summary>
+
+Specify a different port flag:
+```bash
+streamlit run app.py --server.port 8502
+```
+</details>
+
+<details>
+<summary><b>Q4: What if MongoDB Atlas fails to connect or I am offline?</b></summary>
+
+ResQ AI handles database connection failures gracefully and automatically falls back to **Local Offline Mode**. Visual classification, clinical prior fusion, and medical guidance remain 100% operational.
+</details>
+
+<details>
+<summary><b>Q5: What is the temporary <code>tmp...</code> folder created in <code>models/</code>?</b></summary>
 
 In Keras 3, `.keras` files are compressed zip archives containing model weights and architecture JSONs. When calling `tf.keras.models.load_model()`, Keras temporarily extracts the archive into a folder with a `tmp...` prefix to load the layers into RAM. Once loaded, Keras automatically deletes this folder.
 </details>
 
 <details>
-<summary><b>Q2: What is the <code>__pycache__</code> folder?</b></summary>
+<summary><b>Q6: What is the <code>__pycache__</code> folder?</b></summary>
 
 `__pycache__` is automatically generated by Python to store compiled bytecode (`.pyc` files). It speeds up subsequent script executions by avoiding redundant re-compilation. It is completely safe to delete and is excluded via `.gitignore`.
 </details>
 
 <details>
-<summary><b>Q3: Why aren't processed images saved to a folder on disk?</b></summary>
+<summary><b>Q7: Why aren't processed images saved to a folder on disk?</b></summary>
 
 Images are converted directly into NumPy tensors in RAM during inference. Storing them on disk is unnecessary and slows down throughput; Python automatically cleans up memory via garbage collection once prediction outputs are produced.
 </details>
