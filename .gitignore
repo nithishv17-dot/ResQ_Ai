@@ -1,0 +1,7 @@
+﻿*.keras
+models/*.keras
+venv/
+.venv/
+__pycache__/
+.env
+*.db
