@@ -1,5 +1,9 @@
 *.keras
 models/*.keras
+*.pth
+models/*.pth
+*.joblib
+models/*.joblib
 *.part
 models/*.part
 venv/

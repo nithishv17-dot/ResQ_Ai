@@ -1,4 +1,6 @@
 import os
+import pathlib
+import hashlib
 import numpy as np
 import streamlit as st
 import tensorflow as tf
@@ -6,6 +8,38 @@ from PIL import Image
 from dotenv import load_dotenv
 from db_manager import BiteDBManager
 from download_model import ensure_model
+from phase2_voice_triage import (
+    generate_question_audio,
+    transcribe_patient_audio,
+    map_transcript_to_clinical_slots,
+    render_handy_voice_triage_ui,
+    TRIAGE_QUESTIONS,
+    CLINICAL_LOCATIONS,
+    CLINICAL_TIMINGS,
+    CLINICAL_SYMPTOMS,
+)
+from swin_classifier import (
+    SwinClassifier,
+    fuse_vision_probabilities,
+    SWIN_MODEL_PATH as DEFAULT_SWIN_PATH,
+)
+try:
+    from src.models.descriptor_model import DescriptorClassifier
+    from src.models.meta_learner import fuse_tri_branch_probabilities, DEFAULT_BRANCH_WEIGHTS
+    DESCRIPTOR_BRANCH_AVAILABLE = True
+except (ImportError, ModuleNotFoundError):
+    DescriptorClassifier = None
+    fuse_tri_branch_probabilities = None
+    DEFAULT_BRANCH_WEIGHTS = (0.50, 0.50, 0.0)
+    DESCRIPTOR_BRANCH_AVAILABLE = False
+
+try:
+    from src.triage.image_question_engine import VisualTriageQuestionEngine, QUESTION_BANK
+    TRIAGE_ENGINE_AVAILABLE = True
+except (ImportError, ModuleNotFoundError):
+    VisualTriageQuestionEngine = None
+    QUESTION_BANK = {}
+    TRIAGE_ENGINE_AVAILABLE = False
 
 load_dotenv()
 
@@ -30,7 +64,14 @@ CLASSES = [
 ]
 
 CHANNEL_MEANS = np.array([170.88408, 134.76701, 118.84133], dtype=np.float32)
-MODEL_PATH = os.getenv("MODEL_PATH", "models/bug_bite_8class_stacked_model.keras")
+
+BASE_DIR = pathlib.Path(__file__).resolve().parent
+DEFAULT_KERAS_PATH = str(BASE_DIR / "models" / "bug_bite_8class_stacked_model.keras")
+
+MODEL_PATH = os.getenv("MODEL_PATH", DEFAULT_KERAS_PATH)
+SWIN_MODEL_PATH = os.getenv("SWIN_MODEL_PATH", DEFAULT_SWIN_PATH)
+DEFAULT_DESCRIPTOR_PATH = str(BASE_DIR / "models" / "descriptor_classifier.joblib")
+DESCRIPTOR_MODEL_PATH = os.getenv("DESCRIPTOR_MODEL_PATH", DEFAULT_DESCRIPTOR_PATH)
 
 # ---------------------------------------------------------
 # Resource Initialization
@@ -39,16 +80,45 @@ MODEL_PATH = os.getenv("MODEL_PATH", "models/bug_bite_8class_stacked_model.keras
 def load_classifier():
     ensure_model(MODEL_PATH)
     if not os.path.exists(MODEL_PATH):
-        st.error(f"Model file not found at path: `{MODEL_PATH}`")
+        st.error(f"Keras model file not found at path: `{MODEL_PATH}`")
         st.stop()
     return tf.keras.models.load_model(MODEL_PATH)
+
+@st.cache_resource
+def load_swin_classifier():
+    if not os.path.exists(SWIN_MODEL_PATH):
+        st.error(f"PyTorch Swin Transformer model not found at path: `{SWIN_MODEL_PATH}`")
+        st.stop()
+    return SwinClassifier(model_path=SWIN_MODEL_PATH)
+
+@st.cache_resource
+def load_descriptor_classifier():
+    if not DESCRIPTOR_BRANCH_AVAILABLE or DescriptorClassifier is None:
+        return None
+    try:
+        classifier = DescriptorClassifier(model_path=DESCRIPTOR_MODEL_PATH)
+        return classifier if classifier.is_loaded() else None
+    except Exception as e:
+        return None
 
 @st.cache_resource
 def load_db():
     return BiteDBManager()
 
+@st.cache_resource
+def load_triage_engine():
+    if not TRIAGE_ENGINE_AVAILABLE or VisualTriageQuestionEngine is None:
+        return None
+    try:
+        return VisualTriageQuestionEngine()
+    except Exception:
+        return None
+
 model = load_classifier()
+swin_model = load_swin_classifier()
+desc_model = load_descriptor_classifier()
 db = load_db()
+triage_engine = load_triage_engine()
 
 def preprocess_image(image: Image.Image) -> np.ndarray:
     """Preprocesses input image with 224x224 resize and channel-mean subtraction."""
@@ -255,74 +325,123 @@ with st.sidebar:
     st.header("👤 Patient Metadata")
     user_id_val = st.text_input("Patient ID:", value="PATIENT_001")
 
+    st.markdown("---")
+    st.header("🧠 Vision Backbone")
+    vision_options = [
+        "Dual Vision Ensemble (Swin-B + Stacked CNN)",
+        "PyTorch Swin-B Transformer (81.52% Val Acc)",
+        "Keras Tier-2 Stacked CNN Ensemble",
+    ]
+    if desc_model is not None and desc_model.is_loaded():
+        vision_options.insert(0, "Tri-Branch Multimodal Ensemble (Swin-B + CNN + Descriptors)")
+        vision_options.append("Handcrafted Visual Descriptor Classifier")
+    else:
+        st.info("ℹ️ Handcrafted Descriptors disabled (OpenCV not installed in this environment).")
+
+    vision_mode = st.selectbox(
+        "Active Vision Architecture:",
+        vision_options,
+        index=0,
+        help="Select which diagnostic vision architecture drives classification.",
+    )
+
+    swin_acc = swin_model.metadata.get("val_acc")
+    swin_acc_str = f"{swin_acc:.2%}" if swin_acc else "81.52%"
+    st.caption(f"🤖 **Swin-B:** `{os.path.basename(SWIN_MODEL_PATH)}` ({swin_acc_str})")
+    st.caption(f"🤖 **Stacked CNN:** `{os.path.basename(MODEL_PATH)}`")
+    if desc_model is not None and desc_model.is_loaded():
+        st.caption(f"🤖 **Descriptors:** `{os.path.basename(DESCRIPTOR_MODEL_PATH)}` (156 PCA components)")
+
+    st.markdown("---")
     if db.is_connected:
         st.success("🟢 MongoDB Atlas Connected")
     else:
         st.error("🔴 MongoDB Disconnected")
 
-with st.form("diagnosis_form", clear_on_submit=False):
-    col_img, col_text = st.columns([1, 1], gap="large")
+# Initialize session state for clinical context slots, voice triage, and dynamic questions
+if "sel_location_key" not in st.session_state:
+    st.session_state["sel_location_key"] = "Select / Not specified"
+if "sel_timing_key" not in st.session_state:
+    st.session_state["sel_timing_key"] = "Select / Not specified"
+if "sel_symptoms_key" not in st.session_state:
+    st.session_state["sel_symptoms_key"] = []
+if "voice_transcripts" not in st.session_state:
+    st.session_state["voice_transcripts"] = {"q1": "", "q2": "", "q3": "", "single": ""}
+if "voice_audio_hashes" not in st.session_state:
+    st.session_state["voice_audio_hashes"] = {}
+if "interactive_answers" not in st.session_state:
+    st.session_state["interactive_answers"] = {}
+if "has_active_diagnosis" not in st.session_state:
+    st.session_state["has_active_diagnosis"] = False
+if "last_active_file_id" not in st.session_state:
+    st.session_state["last_active_file_id"] = None
 
-    with col_img:
-        st.subheader("1. Bite Image")
-        tab_upload, tab_camera = st.tabs(["📁 Upload Image", "📷 Live Camera"])
+col_img, col_text = st.columns([1, 1], gap="large")
 
-        with tab_upload:
-            uploaded_file = st.file_uploader(
-                "Upload lesion image (JPG, PNG):",
-                type=["jpg", "jpeg", "png"],
-                help="Upload an existing image of the insect bite or skin lesion.",
-            )
-            if uploaded_file is not None:
-                preview_img = Image.open(uploaded_file)
-                st.image(preview_img, caption="📁 Uploaded Image Preview", use_container_width=True)
+with col_img:
+    st.subheader("1. Bite Image")
+    tab_upload, tab_camera = st.tabs(["📁 Upload Image", "📷 Live Camera"])
 
-        with tab_camera:
-            camera_file = st.camera_input(
-                "Capture bite lesion photo:",
-                help="Position the insect bite clearly in frame with adequate lighting, then click 'Take Photo'.",
-            )
-            if camera_file is not None:
-                st.caption("✅ Live camera photo captured.")
-
-    with col_text:
-        st.subheader("2. Clinical Prior Context")
-        loc_val = st.selectbox(
-            "Anatomical Location:",
-            [
-                "Select / Not specified",
-                "Ankles / Feet / Lower Legs",
-                "Waistband / Groin / Skin Folds",
-                "Neck / Face / Arms (Exposed while sleeping)",
-                "Scalp / Behind Ears / Armpits",
-                "General / Other Area",
-            ],
+    with tab_upload:
+        uploaded_file = st.file_uploader(
+            "Upload lesion image (JPG, PNG):",
+            type=["jpg", "jpeg", "png"],
+            help="Upload an existing image of the insect bite or skin lesion.",
         )
+        if uploaded_file is not None:
+            preview_img = Image.open(uploaded_file)
+            st.image(preview_img, caption="📁 Uploaded Image Preview", use_container_width=True)
 
-        time_val = st.selectbox(
-            "Onset Timing:",
-            [
-                "Select / Not specified",
-                "Immediate / within minutes (Instant burning or sharp pain)",
-                "Woke up with bites / Noticed in the morning",
-                "Delayed reaction over 1–3 days (Gradual itching)",
-            ],
+    with tab_camera:
+        camera_file = st.camera_input(
+            "Capture bite lesion photo:",
+            help="Position the insect bite clearly in frame with adequate lighting, then click 'Take Photo'.",
         )
+        if camera_file is not None:
+            st.caption("✅ Live camera photo captured.")
 
-        sym_val = st.multiselect(
-            "Observed Clinical Signs:",
-            [
-                "None / Unsure",
-                "Linear track / 'Breakfast-Lunch-Dinner' clustered line",
-                "Intense itching with small red papules",
-                "Expanding bullseye / target ring rash",
-                "Pustule or white fluid-filled blister",
-                "Two distinct fang marks / Central necrosis",
-                "No itching / completely painless",
-            ],
-        )
+    # Reset dynamic triage answers if image source changes
+    current_active_id = getattr(camera_file, "name", None) or getattr(uploaded_file, "name", None)
+    if current_active_id != st.session_state.get("last_active_file_id"):
+        st.session_state["last_active_file_id"] = current_active_id
+        st.session_state["interactive_answers"] = {}
+        st.session_state["has_active_diagnosis"] = False
+        st.session_state.pop("diagnosis_state", None)
 
-    submit_button = st.form_submit_button("🚀 Run Diagnosis", use_container_width=True)
+with col_text:
+    st.subheader("2. Clinical Prior Context")
+
+    # -----------------------------------------------------
+    # Phase 2 Feature 4: Hands-Free Voice Triage (Handy AI)
+    # -----------------------------------------------------
+    voice_slots = render_handy_voice_triage_ui()
+    if voice_slots and voice_slots.get("is_active"):
+        st.session_state["sel_location_key"] = voice_slots["body_location"]
+        st.session_state["sel_timing_key"] = voice_slots["onset_timing"]
+        st.session_state["sel_symptoms_key"] = voice_slots["hallmark_symptoms"]
+
+    # -----------------------------------------------------
+    # Clinical Prior Dropdowns (Auto-Populated & User-Editable)
+    # -----------------------------------------------------
+    loc_val = st.selectbox(
+        "Anatomical Location:",
+        CLINICAL_LOCATIONS,
+        key="sel_location_key",
+    )
+
+    time_val = st.selectbox(
+        "Onset Timing:",
+        CLINICAL_TIMINGS,
+        key="sel_timing_key",
+    )
+
+    sym_val = st.multiselect(
+        "Observed Clinical Signs:",
+        CLINICAL_SYMPTOMS,
+        key="sel_symptoms_key",
+    )
+
+submit_button = st.button("🚀 Run Diagnosis", type="primary", use_container_width=True)
 
 # ---------------------------------------------------------
 # Execution & Database Logging
@@ -348,28 +467,75 @@ if submit_button:
     else:
         with st.spinner(f"Analyzing visual features ({input_source_label}) and clinical priors..."):
             image_obj = Image.open(active_image)
+
+            # 1. Keras Tier-2 Stacked CNN Prediction
             input_tensor = preprocess_image(image_obj)
             raw_cnn_probs = model.predict(input_tensor, verbose=0)[0]
 
-            has_text, prior_distribution = get_clinical_weights(loc_val, time_val, sym_val)
+            # 2. PyTorch Swin Transformer Prediction
+            swin_probs = swin_model.predict_proba(image_obj)
+
+            # 3. Handcrafted Visual Descriptors & XAI Biomarkers
+            if desc_model is not None and desc_model.is_loaded():
+                desc_probs = desc_model.predict_proba(image_obj)
+                visual_metrics = desc_model.extract_interpretable_metrics(image_obj)
+            else:
+                desc_probs = swin_probs.copy()
+                visual_metrics = {
+                    "erythema_score": 0.0,
+                    "lesion_circularity": 0.0,
+                    "texture_contrast": 0.0,
+                    "lesion_area_ratio": 0.0,
+                    "necrotic_center_contrast": 0.0,
+                    "lesion_solidity": 0.0,
+                    "lesion_eccentricity": 0.0,
+                }
+
+            # 4. Multi-Branch Probability Fusion
+            # Dual Vision Ensemble (50% Swin-B + 50% Stacked CNN)
+            dual_vision_probs = fuse_vision_probabilities(
+                raw_cnn_probs, swin_probs, method="weighted_average", weights=(0.50, 0.50)
+            )
+            # Tri-Branch Multimodal Ensemble (45% Swin + 40% CNN + 15% Descriptors)
+            if fuse_tri_branch_probabilities is not None and (desc_model is not None and desc_model.is_loaded()):
+                tri_vision_probs = fuse_tri_branch_probabilities(
+                    swin_probs, raw_cnn_probs, desc_probs, method="weighted_average", weights=DEFAULT_BRANCH_WEIGHTS
+                )
+            else:
+                tri_vision_probs = dual_vision_probs
+
+            # Select active vision distribution based on sidebar selection
+            if "Tri-Branch" in vision_mode:
+                active_vision_probs = tri_vision_probs
+                vision_label = "Tri-Branch Multimodal Ensemble (Swin-B + CNN + Descriptors)"
+            elif "Dual Vision" in vision_mode:
+                active_vision_probs = dual_vision_probs
+                vision_label = "Dual Vision Ensemble (Swin-B + Stacked CNN)"
+            elif "PyTorch Swin-B" in vision_mode:
+                active_vision_probs = swin_probs
+                vision_label = "PyTorch Swin-B Transformer"
+            elif "Keras Tier-2" in vision_mode:
+                active_vision_probs = raw_cnn_probs
+                vision_label = "Keras Tier-2 Stacked CNN"
+            else:  # Handcrafted Visual Descriptor Classifier
+                active_vision_probs = desc_probs
+                vision_label = "Handcrafted Visual Descriptors"
+
+            has_text, prior_distribution = get_cli  nical_weights(loc_val, time_val, sym_val)
 
             if has_text:
-                is_conflict, final_probs, status_msg = resolve_multimodal_conflict(
-                    raw_cnn_probs, prior_distribution
+                is_conflict, base_probs, status_msg = resolve_multimodal_conflict(
+                    active_vision_probs, prior_distribution
                 )
-                if is_conflict:
-                    st.warning(f"⚠️ {status_msg}")
-                else:
-                    st.info(f"✅ {status_msg}")
             else:
-                final_probs = raw_cnn_probs
-                st.caption("Executed in **Pure Vision Mode** (no clinical metadata provided).")
+                base_probs = active_vision_probs
+                status_msg = ""
+                is_conflict = False
 
-            top_idx = int(np.argmax(final_probs))
+            top_idx = int(np.argmax(base_probs))
             top_class = CLASSES[top_idx]
-            top_conf = float(final_probs[top_idx] * 100)
-
-            prob_dict = {CLASSES[i]: float(final_probs[i]) for i in range(len(CLASSES))}
+            top_conf = float(base_probs[top_idx] * 100)
+            prob_dict = {CLASSES[i]: float(base_probs[i]) for i in range(len(CLASSES))}
 
             # Progression Analysis
             progression_data = db.analyze_progression(
@@ -390,77 +556,238 @@ if submit_button:
                 raw_probs=prob_dict,
             )
 
-        st.markdown("---")
-        st.subheader("📊 Diagnostic Verdict")
-        st.success(
-            f"**Predicted Class:** `{top_class.upper()}` | **Confidence:** {top_conf:.2f}% | **Source:** {input_source_label}"
+            # Save state in session for dynamic interaction
+            st.session_state["interactive_answers"] = {}
+            st.session_state["has_active_diagnosis"] = True
+            st.session_state["diagnosis_state"] = {
+                "base_probs": base_probs,
+                "active_vision_probs": active_vision_probs,
+                "tri_vision_probs": tri_vision_probs,
+                "swin_probs": swin_probs,
+                "raw_cnn_probs": raw_cnn_probs,
+                "desc_probs": desc_probs,
+                "prior_distribution": prior_distribution if has_text else None,
+                "has_text": has_text,
+                "status_msg": status_msg,
+                "is_conflict": is_conflict,
+                "vision_label": vision_label,
+                "input_source_label": input_source_label,
+                "visual_metrics": visual_metrics,
+                "user_id_val": user_id_val,
+                "loc_val": loc_val,
+                "time_val": time_val,
+                "sym_val": sym_val,
+                "doc_id": doc_id,
+                "progression_data": progression_data,
+            }
+
+# ---------------------------------------------------------
+# Dynamic Results & Interactive Visual-Triage Rendering
+# ---------------------------------------------------------
+if st.session_state.get("has_active_diagnosis", False) and "diagnosis_state" in st.session_state:
+    diag = st.session_state["diagnosis_state"]
+    base_probs = diag["base_probs"]
+    visual_metrics = diag["visual_metrics"]
+    answered = st.session_state.get("interactive_answers", {})
+
+    # Apply Bayesian updates if user has answered dynamic clarification questions
+    if triage_engine is not None and answered:
+        final_probs = triage_engine.process_answered_questions(base_probs, answered)
+        is_clarified = True
+    else:
+        final_probs = base_probs.copy()
+        is_clarified = False
+
+    top_idx = int(np.argmax(final_probs))
+    top_class = CLASSES[top_idx]
+    top_conf = float(final_probs[top_idx] * 100)
+
+    # Show multimodal conflict status
+    if diag["has_text"]:
+        if diag["is_conflict"]:
+            st.warning(f"⚠️ {diag['status_msg']}")
+        else:
+            st.info(f"✅ {diag['status_msg']}")
+    else:
+        st.caption(f"Executed in **Pure Vision Mode** via {diag['vision_label']} (no clinical metadata provided).")
+
+    st.markdown("---")
+    st.subheader("📊 Diagnostic Verdict")
+    st.success(
+        f"**Predicted Class:** `{top_class.upper()}` | **Confidence:** {top_conf:.2f}% | **Backbone:** `{diag['vision_label']}` | **Source:** {diag['input_source_label']}"
+    )
+
+    if is_clarified:
+        st.info(
+            f"🧬 **Active Clarification Applied:** {len(answered)} response(s) integrated via Bayesian update. "
+            f"Verdict adjusted based on patient clarification."
         )
 
-        # -----------------------------------------------------
-        # Clinical Risk Assessment & Medical Action Plan
-        # -----------------------------------------------------
-        guidance = get_clinical_guidance(top_class, top_conf, sym_val)
+    # -----------------------------------------------------
+    # Phase 2 Feature 5: Image-Based Dynamic Questioning (Visual-Triage Clarification)
+    # -----------------------------------------------------
+    if triage_engine is not None:
+        clarification_info = triage_engine.select_clarification_questions(
+            final_probs,
+            visual_descriptors=visual_metrics,
+            asked_questions=list(answered.keys()),
+            max_questions=2,
+        )
 
-        st.subheader("🏥 Clinical Risk & Medical Guidance")
+        with st.container(border=True):
+            st.markdown("### ❓ Image-Based Dynamic Questioning (Visual-Triage Clarification)")
 
-        if guidance["risk_type"] == "error":
-            st.error(
-                f"🚨 **Risk Level: {guidance['risk_level']}**\n\n{guidance['rationale']}"
+            # Render existing answers
+            if answered:
+                st.markdown(f"**Current Clarification Responses ({len(answered)} recorded):**")
+                ans_cols = st.columns(min(len(answered), 3))
+                for c, (q_id, ans_val) in zip(ans_cols, answered.items()):
+                    q_obj = triage_engine.question_bank.get(q_id)
+                    q_label = q_obj.prompt if q_obj else q_id
+                    with c:
+                        st.info(f"**{q_label}**\n\nYour Answer: `{ans_val}`")
+
+                if st.button("🔄 Reset Clarification Questions", key="reset_clarify_btn"):
+                    st.session_state["interactive_answers"] = {}
+                    st.rerun()
+
+            if clarification_info["needs_clarification"] and clarification_info["questions"]:
+                st.warning(f"⚠️ **Visual Ambiguity Detected:** {clarification_info['explanation']}")
+                st.markdown("Please answer the following follow-up questions to help differentiate the most likely candidates:")
+
+                for idx, q in enumerate(clarification_info["questions"]):
+                    with st.container(border=True):
+                        qc1, qc2 = st.columns([3, 2])
+                        with qc1:
+                            st.markdown(f"**Question {idx+1} ({q['category']})** • *Expected Info Gain: {q['information_gain']} bits*")
+                            st.markdown(f"#### {q['prompt']}")
+                            st.caption(f"💡 *Clinical rationale:* {q['clinical_rationale']}")
+                            if q.get("visual_reason"):
+                                st.info(f"🔬 **Visual Biomarker Trigger:** {q['visual_reason']}")
+                            st.caption(f"ℹ️ *Disambiguation Reason:* {q['xai_explanation']}")
+                        with qc2:
+                            st.markdown("**Your Answer:**")
+                            b1, b2, b3 = st.columns(3)
+                            with b1:
+                                if st.button("✅ Yes", key=f"btn_yes_{q['id']}", use_container_width=True):
+                                    st.session_state["interactive_answers"][q["id"]] = "Yes"
+                                    st.rerun()
+                            with b2:
+                                if st.button("❌ No", key=f"btn_no_{q['id']}", use_container_width=True):
+                                    st.session_state["interactive_answers"][q["id"]] = "No"
+                                    st.rerun()
+                            with b3:
+                                if st.button("🤷 Unsure", key=f"btn_unsure_{q['id']}", use_container_width=True):
+                                    st.session_state["interactive_answers"][q["id"]] = "Not sure"
+                                    st.rerun()
+            elif not clarification_info["needs_clarification"] and answered:
+                st.success("✅ **Diagnostic Ambiguity Resolved:** Active clarification questions successfully differentiated candidate classes.")
+            else:
+                st.caption("✅ **High Visual Confidence:** Visual prediction meets confidence thresholds (>75%, low entropy). No follow-up questions needed.")
+
+    # -----------------------------------------------------
+    # Explainable AI (XAI): Visual Biomarkers & Lesion Morphology
+    # -----------------------------------------------------
+    with st.expander("🔬 Explainable AI (XAI): Visual Biomarkers & Lesion Morphology", expanded=True):
+        m_col1, m_col2, m_col3, m_col4 = st.columns(4)
+        with m_col1:
+            st.metric(
+                label="🔴 Erythema (Redness)",
+                value=f"{visual_metrics['erythema_score']:.2f}",
+                help="LAB a* elevation index representing localized cutaneous capillary inflammation."
             )
-        elif guidance["risk_type"] == "warning":
-            st.warning(
-                f"⚠️ **Risk Level: {guidance['risk_level']}**\n\n{guidance['rationale']}"
+            st.caption("Active Inflammation" if visual_metrics['erythema_score'] > 0.4 else "Mild / Basal Redness")
+        with m_col2:
+            st.metric(
+                label="🎯 Lesion Circularity",
+                value=f"{visual_metrics['lesion_circularity']:.2f}",
+                help="4*pi*Area/Perimeter^2 (1.0 = perfect circle, characteristic of tick erythema migrans target rash)."
             )
-        elif guidance["risk_type"] == "info":
-            st.info(
-                f"ℹ️ **Risk Level: {guidance['risk_level']}**\n\n{guidance['rationale']}"
+            st.caption("Target Rash Pattern" if visual_metrics['lesion_circularity'] > 0.6 else "Irregular Mark")
+        with m_col3:
+            st.metric(
+                label="⚫ Necrotic Center Contrast",
+                value=f"{visual_metrics['necrotic_center_contrast']:.1f}",
+                help="Lightness drop between periphery and center. High positive values indicate a necrotic or dark core (spider bite)."
             )
-        else:
-            st.success(
-                f"✅ **Risk Level: {guidance['risk_level']}**\n\n{guidance['rationale']}"
+            st.caption("Central Depression" if visual_metrics['necrotic_center_contrast'] > 10.0 else "Uniform Tone")
+        with m_col4:
+            st.metric(
+                label="🧬 Texture Contrast",
+                value=f"{visual_metrics['texture_contrast']:.2f}",
+                help="GLCM micro-roughness capturing blister, crusting, or skin breakdown."
             )
+            st.caption(f"Area: {visual_metrics['lesion_area_ratio']*100:.1f}% field")
 
-        with st.expander("📋 Medical Action Plan & First-Aid Protocol", expanded=True):
-            guide_col1, guide_col2 = st.columns(2, gap="medium")
-            with guide_col1:
-                st.markdown("#### 🩹 First-Aid & Immediate Actions")
-                for item in guidance["first_aid"]:
-                    st.markdown(f"- {item}")
-            with guide_col2:
-                st.markdown("#### 🚨 Emergency Red-Flag Warnings")
-                for flag in guidance["red_flags"]:
-                    st.markdown(f"- {flag}")
-                if top_class != "no_bites":
-                    st.caption("❗ Seek immediate emergency medical care if breathing distress, systemic allergy, or spreading infection occurs.")
+    # -----------------------------------------------------
+    # Clinical Risk Assessment & Medical Action Plan
+    # -----------------------------------------------------
+    guidance = get_clinical_guidance(top_class, top_conf, diag["sym_val"])
 
-        if doc_id:
-            st.success(f"💾 **Logged to MongoDB Atlas** | Document ID: `{doc_id}`")
-        else:
-            st.warning("⚠️ Record could not be saved to the database.")
+    st.subheader("🏥 Clinical Risk & Medical Guidance")
 
-        if progression_data and progression_data.get("risk_alerts"):
-            st.error("🚨 **Progression Warning:**")
-            for alert in progression_data["risk_alerts"]:
-                st.write(f"- {alert}")
+    if guidance["risk_type"] == "error":
+        st.error(
+            f"🚨 **Risk Level: {guidance['risk_level']}**\n\n{guidance['rationale']}"
+        )
+    elif guidance["risk_type"] == "warning":
+        st.warning(
+            f"⚠️ **Risk Level: {guidance['risk_level']}**\n\n{guidance['rationale']}"
+        )
+    elif guidance["risk_type"] == "info":
+        st.info(
+            f"ℹ️ **Risk Level: {guidance['risk_level']}**\n\n{guidance['rationale']}"
+        )
+    else:
+        st.success(
+            f"✅ **Risk Level: {guidance['risk_level']}**\n\n{guidance['rationale']}"
+        )
 
-        res_col1, res_col2 = st.columns(2)
-        with res_col1:
-            st.write("### Probability Breakdown")
-            for idx in np.argsort(final_probs)[::-1]:
-                c_name = CLASSES[idx]
-                p_val = final_probs[idx]
-                st.write(f"**{c_name:<12}** `{p_val * 100:5.2f}%`")
-                st.progress(float(p_val))
+    with st.expander("📋 Medical Action Plan & First-Aid Protocol", expanded=True):
+        guide_col1, guide_col2 = st.columns(2, gap="medium")
+        with guide_col1:
+            st.markdown("#### 🩹 First-Aid & Immediate Actions")
+            for item in guidance["first_aid"]:
+                st.markdown(f"- {item}")
+        with guide_col2:
+            st.markdown("#### 🚨 Emergency Red-Flag Warnings")
+            for flag in guidance["red_flags"]:
+                st.markdown(f"- {flag}")
+            if top_class != "no_bites":
+                st.caption("❗ Seek immediate emergency medical care if breathing distress, systemic allergy, or spreading infection occurs.")
 
-        with res_col2:
-            if has_text:
-                st.write("### Modality Calibration Comparison")
-                records = []
-                for i, c_name in enumerate(CLASSES):
-                    records.append({
-                        "Class": c_name,
-                        "Vision CNN": f"{raw_cnn_probs[i]*100:.1f}%",
-                        "Clinical Prior": f"{prior_distribution[i]*100:.1f}%",
-                        "Final Calibrated": f"{final_probs[i]*100:.1f}%",
-                    })
-                st.table(records)
+    if diag.get("doc_id"):
+        st.success(f"💾 **Logged to MongoDB Atlas** | Document ID: `{diag['doc_id']}`")
+    else:
+        st.warning("⚠️ Record could not be saved to the database.")
+
+    if diag.get("progression_data") and diag["progression_data"].get("risk_alerts"):
+        st.error("🚨 **Progression Warning:**")
+        for alert in diag["progression_data"]["risk_alerts"]:
+            st.write(f"- {alert}")
+
+    res_col1, res_col2 = st.columns(2)
+    with res_col1:
+        st.write("### Probability Breakdown")
+        for idx in np.argsort(final_probs)[::-1]:
+            c_name = CLASSES[idx]
+            p_val = final_probs[idx]
+            st.write(f"**{c_name:<12}** `{p_val * 100:5.2f}%`")
+            st.progress(float(p_val))
+
+    with res_col2:
+        st.write("### Modality Calibration Comparison")
+        records = []
+        for i, c_name in enumerate(CLASSES):
+            rec = {
+                "Class": c_name,
+                "Tri-Branch": f"{diag['tri_vision_probs'][i]*100:.1f}%",
+                "Swin-B": f"{diag['swin_probs'][i]*100:.1f}%",
+                "Stacked CNN": f"{diag['raw_cnn_probs'][i]*100:.1f}%",
+                "Descriptors": f"{diag['desc_probs'][i]*100:.1f}%",
+            }
+            if diag["has_text"]:
+                rec["Prior"] = f"{diag['prior_distribution'][i]*100:.1f}%"
+            rec["Final"] = f"{final_probs[i]*100:.1f}%"
+            records.append(rec)
+        st.table(records)
